@@ -6,6 +6,7 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.ChatRepository
+import com.example.data.ConnectionResult
 import com.example.data.MailConfig
 import com.example.data.P2PChat
 import com.example.data.P2PMessage
@@ -47,6 +48,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val chats: StateFlow<List<P2PChat>> = repository.chatsFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     val messages: StateFlow<List<P2PMessage>> = _activePartnerEmail
         .flatMapLatest { email ->
             if (email == null) flowOf(emptyList())
@@ -54,9 +56,34 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    var lastAttemptedEmail: String? = null
+        private set
+    var lastAttemptedDisplayName: String? = null
+        private set
+
+    private val _pendingAuthIntent = MutableStateFlow<android.content.Intent?>(null)
+    val pendingAuthIntent: StateFlow<android.content.Intent?> = _pendingAuthIntent.asStateFlow()
+
+    fun clearPendingAuthIntent() {
+        _pendingAuthIntent.value = null
+    }
+
+    fun setLoginError(msg: String) {
+        _loginError.value = msg
+    }
+
     private var pollingJob: Job? = null
 
+    private val sharedPreferenceChangeListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == "password" || key == "email") {
+            viewModelScope.launch(Dispatchers.Main) {
+                loadSavedConfig()
+            }
+        }
+    }
+
     init {
+        prefs.registerOnSharedPreferenceChangeListener(sharedPreferenceChangeListener)
         loadSavedConfig()
     }
 
@@ -69,6 +96,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val smtpPort = prefs.getInt("smtp_port", 465)
         val useSsl = prefs.getBoolean("use_ssl", true)
         val password = prefs.getString("password", "") ?: ""
+        val isOauth = prefs.getBoolean("is_oauth", false)
 
         if (email.isNotEmpty() && password.isNotEmpty()) {
             val config = MailConfig(
@@ -79,7 +107,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 smtpHost = smtpHost,
                 smtpPort = smtpPort,
                 useSsl = useSsl,
-                password = password
+                password = password,
+                isOauth = isOauth
             )
             _connectionConfig.value = config
             startAutoPolling()
@@ -90,10 +119,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             _isConnecting.value = true
             _loginError.value = null
+            
+            // Test SMTP and IMAP connections concurrently/sequentially
+            val result = repository.verifyNodeConnection(config)
+            if (result is ConnectionResult.Failure) {
+                _isConnecting.value = false
+                _loginError.value = result.message
+                return@launch
+            }
+
             try {
-                // Test IMAP connection
-                repository.pollImapMessages(config)
-                
                 // Connection was successful, save credentials
                 prefs.edit().apply {
                     putString("email", config.email)
@@ -104,6 +139,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     putInt("smtp_port", config.smtpPort)
                     putBoolean("use_ssl", config.useSsl)
                     putString("password", config.password)
+                    putBoolean("is_oauth", config.isOauth)
                 }.apply()
 
                 _connectionConfig.value = config
@@ -119,6 +155,59 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val errMsg = e.localizedMessage ?: "Неизвестная ошибка подключения"
                 _loginError.value = "Ошибка подключения к почтовому серверу: $errMsg"
                 Log.e("ChatViewModel", "Login validation failed", e)
+            }
+        }
+    }
+
+    fun loginWithGoogle(email: String, displayName: String, context: Context) {
+        lastAttemptedEmail = email
+        lastAttemptedDisplayName = displayName
+        viewModelScope.launch(Dispatchers.IO) {
+            _isConnecting.value = true
+            _loginError.value = null
+            try {
+                val scope = "oauth2:https://mail.google.com/ https://www.googleapis.com/auth/userinfo.email"
+                val token = com.google.android.gms.auth.GoogleAuthUtil.getToken(context, email, scope)
+                
+                val config = MailConfig(
+                    email = email,
+                    displayName = displayName.ifEmpty { email.substringBefore("@") },
+                    imapHost = "imap.gmail.com",
+                    imapPort = 993,
+                    smtpHost = "smtp.gmail.com",
+                    smtpPort = 465,
+                    useSsl = true,
+                    password = token,
+                    isOauth = true
+                )
+                
+                // Validate node via testing connection
+                repository.pollImapMessages(config)
+                
+                // Connection was successful, save credentials
+                prefs.edit().apply {
+                    putString("email", config.email)
+                    putString("display_name", config.displayName)
+                    putString("imap_host", config.imapHost)
+                    putInt("imap_port", config.imapPort)
+                    putString("smtp_host", config.smtpHost)
+                    putInt("smtp_port", config.smtpPort)
+                    putBoolean("use_ssl", config.useSsl)
+                    putString("password", config.password)
+                    putBoolean("is_oauth", config.isOauth)
+                }.apply()
+
+                _connectionConfig.value = config
+                _isConnecting.value = false
+                startAutoPolling()
+            } catch (e: com.google.android.gms.auth.UserRecoverableAuthException) {
+                _isConnecting.value = false
+                _pendingAuthIntent.value = e.intent
+            } catch (e: Exception) {
+                _isConnecting.value = false
+                val errMsg = e.localizedMessage ?: "Сбой авторизации"
+                _loginError.value = "Ошибка входа Google: $errMsg"
+                Log.e("ChatViewModel", "OAuth failed", e)
             }
         }
     }
@@ -225,6 +314,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        prefs.unregisterOnSharedPreferenceChangeListener(sharedPreferenceChangeListener)
         pollingJob?.cancel()
         super.onCleared()
     }

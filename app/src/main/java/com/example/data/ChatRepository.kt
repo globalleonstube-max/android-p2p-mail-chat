@@ -20,10 +20,27 @@ data class MailConfig(
     val smtpHost: String,
     val smtpPort: Int,
     val useSsl: Boolean,
-    val password: String
+    val password: String,
+    val isOauth: Boolean = false
 )
 
-class ChatRepository(context: Context) {
+class ChatRepository(private val context: Context) {
+
+    private val connectionService = ConnectionService(context)
+
+    suspend fun verifyNodeConnection(config: MailConfig): ConnectionResult {
+        return connectionService.verifyConnection(config)
+    }
+
+    suspend fun refreshOAuthToken(email: String, oldToken: String): String = withContext(Dispatchers.IO) {
+        try {
+            com.google.android.gms.auth.GoogleAuthUtil.clearToken(context, oldToken)
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "Failed clearing token", e)
+        }
+        val scope = "oauth2:https://mail.google.com/ https://www.googleapis.com/auth/userinfo.email"
+        com.google.android.gms.auth.GoogleAuthUtil.getToken(context, email, scope)
+    }
 
     private val db = Room.databaseBuilder(
         context.applicationContext,
@@ -83,41 +100,59 @@ class ChatRepository(context: Context) {
         body: String,
         config: MailConfig
     ): P2PMessage = withContext(Dispatchers.IO) {
-        val props = Properties()
-        props["mail.smtp.auth"] = "true"
-        props["mail.smtp.host"] = config.smtpHost
-        props["mail.smtp.port"] = config.smtpPort.toString()
-        
-        if (config.useSsl) {
-            props["mail.smtp.socketFactory.port"] = config.smtpPort.toString()
-            props["mail.smtp.socketFactory.class"] = "javax.net.ssl.SSLSocketFactory"
-            props["mail.smtp.ssl.enable"] = "true"
-        } else {
-            props["mail.smtp.starttls.enable"] = "true"
+        var currentConfig = config
+        var attempt = 1
+        var lastException: Exception? = null
+
+        while (attempt <= 2) {
+            val props = connectionService.createSmtpProperties(currentConfig)
+            val protocol = if (currentConfig.useSsl) "smtps" else "smtp"
+
+            val session = Session.getInstance(props)
+            session.debug = true
+            val msg = MimeMessage(session)
+            msg.setFrom(InternetAddress(currentConfig.email, currentConfig.displayName))
+            msg.setRecipients(Message.RecipientType.TO, InternetAddress.parse(recipient))
+            msg.subject = "[P2P-Mail-Chat]"
+            msg.setText(body, "UTF-8")
+
+            val transport = session.getTransport(protocol)
+            try {
+                transport.connect(currentConfig.smtpHost, currentConfig.smtpPort, currentConfig.email, currentConfig.password)
+                transport.sendMessage(msg, msg.allRecipients)
+                transport.close()
+                lastException = null
+                break
+            } catch (e: Exception) {
+                lastException = e
+                try { transport.close() } catch (ignored: Exception) {}
+                if (currentConfig.isOauth && (e is AuthenticationFailedException || e.message?.contains("auth", ignoreCase = true) == true) && attempt == 1) {
+                    Log.d("ChatRepository", "SMTP OAuth failed, attempting token refresh")
+                    try {
+                        val newToken = refreshOAuthToken(currentConfig.email, currentConfig.password)
+                        val prefs = context.getSharedPreferences("p2p_mail_chat_prefs", Context.MODE_PRIVATE)
+                        prefs.edit().putString("password", newToken).apply()
+                        currentConfig = currentConfig.copy(password = newToken)
+                        attempt++
+                        continue
+                    } catch (tx: Exception) {
+                        Log.e("ChatRepository", "Token refresh failed during SMTP send", tx)
+                        throw tx
+                    }
+                } else {
+                    throw e
+                }
+            }
         }
 
-        // Timeout settings
-        props["mail.smtp.connectiontimeout"] = "10000"
-        props["mail.smtp.timeout"] = "10000"
-
-        val session = Session.getInstance(props, object : Authenticator() {
-            override fun getPasswordAuthentication(): PasswordAuthentication {
-                return PasswordAuthentication(config.email, config.password)
-            }
-        })
-
-        val msg = MimeMessage(session)
-        msg.setFrom(InternetAddress(config.email, config.displayName))
-        msg.setRecipients(Message.RecipientType.TO, InternetAddress.parse(recipient))
-        msg.subject = "[P2P-Mail-Chat]"
-        msg.setText(body, "UTF-8")
-
-        Transport.send(msg)
+        if (attempt > 2 && lastException != null) {
+            throw lastException
+        }
 
         val timestamp = System.currentTimeMillis()
         val sentMessage = P2PMessage(
             partnerEmail = recipient.lowercase().trim(),
-            senderEmail = config.email,
+            senderEmail = currentConfig.email,
             recipientEmail = recipient,
             body = body,
             timestamp = timestamp
@@ -129,93 +164,105 @@ class ChatRepository(context: Context) {
     }
 
     suspend fun pollImapMessages(config: MailConfig): Int = withContext(Dispatchers.IO) {
-        val props = Properties()
-        props["mail.store.protocol"] = if (config.useSsl) "imaps" else "imap"
-        
-        if (config.useSsl) {
-            props["mail.imap.socketFactory.port"] = config.imapPort.toString()
-            props["mail.imap.socketFactory.class"] = "javax.net.ssl.SSLSocketFactory"
-            props["mail.imap.ssl.enable"] = "true"
-        } else {
-            props["mail.imap.starttls.enable"] = "true"
-        }
+        var currentConfig = config
+        var attempt = 1
+        var lastException: Exception? = null
 
-        // Timeout settings
-        props["mail.imap.connectiontimeout"] = "10000"
-        props["mail.imap.timeout"] = "10000"
+        while (attempt <= 2) {
+            val props = connectionService.createImapProperties(currentConfig)
+            val protocol = if (currentConfig.useSsl) "imaps" else "imap"
 
-        val session = Session.getInstance(props)
-        val store = session.getStore(if (config.useSsl) "imaps" else "imap")
-        
-        try {
-            store.connect(config.imapHost, config.imapPort, config.email, config.password)
-        } catch (e: Exception) {
-            Log.e("ChatRepository", "Connection failed", e)
-            throw e
-        }
+            val session = Session.getInstance(props)
+            val store = session.getStore(protocol)
+            
+            try {
+                store.connect(currentConfig.imapHost, currentConfig.imapPort, currentConfig.email, currentConfig.password)
+                val inbox = store.getFolder("INBOX")
+                inbox.open(Folder.READ_ONLY)
 
-        val inbox = store.getFolder("INBOX")
-        inbox.open(Folder.READ_ONLY)
+                val messageCount = inbox.messageCount
+                var newMessagesCount = 0
 
-        val messageCount = inbox.messageCount
-        var newMessagesCount = 0
+                if (messageCount > 0) {
+                    val start = max(1, messageCount - 49) // Fetch last 50 emails
+                    val end = messageCount
+                    val messages = inbox.getMessages(start, end)
 
-        if (messageCount > 0) {
-            val start = max(1, messageCount - 49) // Fetch last 50 emails
-            val end = messageCount
-            val messages = inbox.getMessages(start, end)
+                    // Get already saved messages to avoid duplicates
+                    val recentLocal = dao.getAllRecentMessages()
+                    val existingFingerprints = recentLocal.map { "${it.senderEmail}_${it.timestamp}" }.toSet()
 
-            // Get already saved messages to avoid duplicates
-            val recentLocal = dao.getAllRecentMessages()
-            val existingFingerprints = recentLocal.map { "${it.senderEmail}_${it.timestamp}" }.toSet()
+                    for (m in messages) {
+                        try {
+                            val subject = m.subject ?: ""
+                            if (subject.contains("[P2P-Mail-Chat]", ignoreCase = true)) {
+                                val sender = m.from?.firstOrNull()?.toString() ?: ""
+                                val senderEmail = parseEmailAddress(sender)
+                                val timestamp = m.sentDate?.time ?: m.receivedDate?.time ?: System.currentTimeMillis()
 
-            for (m in messages) {
-                try {
-                    val subject = m.subject ?: ""
-                    if (subject.contains("[P2P-Mail-Chat]", ignoreCase = true)) {
-                        val sender = m.from?.firstOrNull()?.toString() ?: ""
-                        val senderEmail = parseEmailAddress(sender)
-                        val timestamp = m.sentDate?.time ?: m.receivedDate?.time ?: System.currentTimeMillis()
+                                val fingerprint = "${senderEmail}_${timestamp}"
+                                if (senderEmail.isNotEmpty() && 
+                                    senderEmail.lowercase() != currentConfig.email.lowercase() && 
+                                    !existingFingerprints.contains(fingerprint)) {
 
-                        val fingerprint = "${senderEmail}_${timestamp}"
-                        if (senderEmail.isNotEmpty() && 
-                            senderEmail.lowercase() != config.email.lowercase() && 
-                            !existingFingerprints.contains(fingerprint)) {
-
-                            // Parse email content
-                            val bodyText = extractTextFromMessage(m)
-                            val cleanMsg = P2PMessage(
-                                partnerEmail = senderEmail.lowercase().trim(),
-                                senderEmail = senderEmail,
-                                recipientEmail = config.email,
-                                body = bodyText.trim(),
-                                timestamp = timestamp
-                            )
-                            
-                            // Save to local Room
-                            dao.insertMessage(cleanMsg)
-                            
-                            // Upsert chat record
-                            dao.insertChat(
-                                P2PChat(
-                                    partnerEmail = senderEmail.lowercase().trim(),
-                                    lastMessage = cleanMsg.body,
-                                    lastUpdated = cleanMsg.timestamp,
-                                    unreadCount = 0
-                                )
-                            )
-                            newMessagesCount++
+                                    // Parse email content
+                                    val bodyText = extractTextFromMessage(m)
+                                    val cleanMsg = P2PMessage(
+                                        partnerEmail = senderEmail.lowercase().trim(),
+                                        senderEmail = senderEmail,
+                                        recipientEmail = currentConfig.email,
+                                        body = bodyText.trim(),
+                                        timestamp = timestamp
+                                    )
+                                    
+                                    // Save to local Room
+                                    dao.insertMessage(cleanMsg)
+                                    
+                                    // Upsert chat record
+                                    dao.insertChat(
+                                        P2PChat(
+                                            partnerEmail = senderEmail.lowercase().trim(),
+                                            lastMessage = cleanMsg.body,
+                                            lastUpdated = cleanMsg.timestamp,
+                                            unreadCount = 0
+                                        )
+                                    )
+                                    newMessagesCount++
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e("ChatRepository", "Error parsing single email", e)
                         }
                     }
-                } catch (e: Exception) {
-                    Log.e("ChatRepository", "Error parsing single email", e)
+                }
+
+                inbox.close(false)
+                store.close()
+                lastException = null
+                return@withContext newMessagesCount
+            } catch (e: Exception) {
+                lastException = e
+                try { store.close() } catch (ignored: Exception) {}
+                if (currentConfig.isOauth && (e is AuthenticationFailedException || e.message?.contains("auth", ignoreCase = true) == true) && attempt == 1) {
+                    Log.d("ChatRepository", "IMAP OAuth failed, attempting token refresh")
+                    try {
+                        val newToken = refreshOAuthToken(currentConfig.email, currentConfig.password)
+                        val prefs = context.getSharedPreferences("p2p_mail_chat_prefs", Context.MODE_PRIVATE)
+                        prefs.edit().putString("password", newToken).apply()
+                        currentConfig = currentConfig.copy(password = newToken)
+                        attempt++
+                        continue
+                    } catch (tx: Exception) {
+                        Log.e("ChatRepository", "Failed token refresh during IMAP poll", tx)
+                        throw tx
+                    }
+                } else {
+                    Log.e("ChatRepository", "Connection failed", e)
+                    throw e
                 }
             }
         }
-
-        inbox.close(false)
-        store.close()
-        newMessagesCount
+        throw lastException ?: Exception("IMAP poll failed after token retries")
     }
 
     private fun parseEmailAddress(raw: String): String {

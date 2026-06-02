@@ -28,29 +28,15 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.MailConfig
+import com.example.data.MailPresets
 import com.example.ui.ChatViewModel
-
-data class ProviderPreset(
-    val name: String,
-    val imapHost: String,
-    val imapPort: Int,
-    val smtpHost: String,
-    val smtpPort: Int,
-    val ssl: Boolean
-)
-
-val PRESETS = listOf(
-    ProviderPreset("Gmail", "imap.gmail.com", 993, "smtp.gmail.com", 465, true),
-    ProviderPreset("Yandex", "imap.yandex.ru", 993, "smtp.yandex.ru", 465, true),
-    ProviderPreset("Mail.ru", "imap.mail.ru", 993, "smtp.mail.ru", 465, true),
-    ProviderPreset("Outlook", "outlook.office365.com", 993, "smtp.office365.com", 587, false)
-)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConfigScreen(
     viewModel: ChatViewModel,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onGoogleSignIn: () -> Unit = {}
 ) {
     val isConnecting by viewModel.isConnecting.collectAsState()
     val loginError by viewModel.loginError.collectAsState()
@@ -64,6 +50,7 @@ fun ConfigScreen(
     var useSsl by remember { mutableStateOf(true) }
     var password by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
+    var selectedPresetName by remember { mutableStateOf("") }
 
     val gradientBg = Brush.verticalGradient(
         colors = listOf(
@@ -187,32 +174,29 @@ fun ConfigScreen(
                         .padding(vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    PRESETS.forEach { preset ->
+                    MailPresets.list.forEach { preset ->
                         Box(
                             modifier = Modifier
                                 .weight(1f)
                                 .clip(RoundedCornerShape(16.dp))
-                                .border(BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant), RoundedCornerShape(16.dp))
-                                .background(MaterialTheme.colorScheme.secondaryContainer)
+                                .border(BorderStroke(1.dp, if (selectedPresetName == preset.name) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant), RoundedCornerShape(16.dp))
+                                .background(if (selectedPresetName == preset.name) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.secondaryContainer)
                                 .clickable {
+                                    selectedPresetName = preset.name
                                     imapHost = preset.imapHost
                                     imapPort = preset.imapPort.toString()
                                     smtpHost = preset.smtpHost
                                     smtpPort = preset.smtpPort.toString()
-                                    useSsl = preset.ssl
-                                    if (email.contains("@") && !email.endsWith("@gmail.com") && !email.endsWith("@yandex.ru") && !email.endsWith("@mail.ru") && !email.endsWith("@outlook.com")) {
+                                    useSsl = preset.useSsl
+                                    if (email.contains("@") && !email.endsWith("@gmail.com") && !email.endsWith("@yandex.ru") && !email.endsWith("@mail.ru") && !email.endsWith("@outlook.com") && !email.endsWith("@yahoo.com")) {
                                         // User had typed some custom email, keep it
                                     } else {
                                         // Suggest domain
-                                        val extension = when (preset.name) {
-                                            "Gmail" -> "@gmail.com"
-                                            "Yandex" -> "@yandex.ru"
-                                            "Mail.ru" -> "@mail.ru"
-                                            "Outlook" -> "@outlook.com"
-                                            else -> ""
-                                        }
+                                        val extension = preset.domain
                                         if (email.substringBefore("@").isNotEmpty()) {
                                             email = email.substringBefore("@") + extension
+                                        } else {
+                                            email = "user" + extension
                                         }
                                     }
                                 }
@@ -223,10 +207,88 @@ fun ConfigScreen(
                                 text = preset.name,
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.primary,
+                                color = if (selectedPresetName == preset.name) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.primary,
                                 textAlign = TextAlign.Center
                             )
                         }
+                    }
+                }
+
+                if (selectedPresetName.isNotEmpty()) {
+                    val matchingPreset = MailPresets.list.firstOrNull { it.name == selectedPresetName }
+                    if (matchingPreset != null) {
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                            ),
+                            shape = RoundedCornerShape(16.dp),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(16.dp),
+                                verticalAlignment = Alignment.Top
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Info,
+                                    contentDescription = "Информация",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column {
+                                    Text(
+                                        text = "Настройка ${matchingPreset.name}:",
+                                        fontWeight = FontWeight.Bold,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    val translatedHelp = when (matchingPreset.name) {
+                                        "Gmail" -> "Потребуется ввести 16-значный 'Пароль приложения' вместо обычного пароля аккаунта Google (или выполните быстрый вход через Google OAuth2 выше)."
+                                        "Yandex" -> "Перед входом зайдите в веб-интерфейс Яндекс.Почты -> Настройки (шестеренка вверху справа) -> Почтовые программы -> Поставьте галочки у IMAP/SMTP. После этого создайте Пароль приложения в безопасности Яндекс ID."
+                                        "Mail.ru" -> "Зайдите в Личный кабинет Mail.ru -> Пароли и безопасность -> Пароли для внешних приложений -> Создать. Используйте этот пароль для входа в чат."
+                                        "Outlook" -> "Задайте STARTTLS порт SMTP: 587. Мы автоматически настроили необходимые параметры."
+                                        "Yahoo" -> "Зайдите на вкладку Account Security в Yahoo, сгенерируйте пароль приложения и ведите его в поле пароля."
+                                        else -> matchingPreset.infoMessage
+                                    }
+                                    Text(
+                                        text = translatedHelp,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        lineHeight = 16.sp
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                OutlinedButton(
+                    onClick = onGoogleSignIn,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp)
+                        .testTag("google_login_button"),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.onSurface
+                    ),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        GoogleIcon()
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = "Войти через Google (OAuth2)",
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
                     }
                 }
 
@@ -443,6 +505,21 @@ fun ConfigScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+fun GoogleIcon(modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier.size(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = "G",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.ExtraBold,
+            color = Color(0xFF4285F4)
+        )
     }
 }
 
