@@ -1,0 +1,6 @@
+{
+  "name": "P2P Mail Chat",
+  "description": "Turning your everyday email inbox into a secure, decentralized P2P communication node.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
